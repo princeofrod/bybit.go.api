@@ -137,7 +137,7 @@ func (b *WebSocket) Connect() *WebSocket {
 	go b.monitorConnection()
 
 	b.ctx, b.cancel = context.WithCancel(context.Background())
-	ping(b)
+	go ping(b)
 
 	return b
 }
@@ -154,7 +154,6 @@ func (b *WebSocket) SendSubscription(args []string) (*WebSocket, error) {
 		fmt.Println("Failed to send subscription:", err)
 		return b, err
 	}
-	fmt.Println("Subscription sent successfully.")
 	return b, nil
 }
 
