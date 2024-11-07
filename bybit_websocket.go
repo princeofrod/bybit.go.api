@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
@@ -16,26 +17,43 @@ type MessageHandler func(message string) error
 
 func (b *WebSocket) handleIncomingMessages() {
 	for {
-		_, message, err := b.conn.ReadMessage()
-		if err != nil {
-			fmt.Println("Error reading:", err)
-			b.isConnected = false
+		select {
+		case <-b.ctx.Done():
+			fmt.Println("websocket context is closed")
 			return
-		}
-
-		if b.onMessage != nil {
-			err := b.onMessage(string(message))
+		default:
+			_, message, err := b.conn.ReadMessage()
 			if err != nil {
-				fmt.Println("Error handling message:", err)
+				b.newError(errors.New("Error reading: " + err.Error()))
+				b.isConnected = false
+				b.newError(err)
 				return
 			}
+
+			if b.onMessage != nil {
+				err := b.onMessage(string(message))
+				if err != nil {
+					b.newError(errors.New("Error handling message: " + err.Error()))
+					return
+				}
+			}
 		}
+
 	}
 }
 
 func (b *WebSocket) monitorConnection() {
 	ticker := time.NewTicker(time.Second * 5) // Check every 5 seconds
 	defer ticker.Stop()
+
+	go func() {
+		select {
+		case <-b.ctx.Done():
+			b.Disconnect()
+			return // Stop the routine if context is done
+		default:
+		}
+	}()
 
 	for {
 		<-ticker.C
@@ -48,12 +66,6 @@ func (b *WebSocket) monitorConnection() {
 				b.isConnected = true
 				go b.handleIncomingMessages() // Restart message handling
 			}
-		}
-
-		select {
-		case <-b.ctx.Done():
-			return // Stop the routine if context is done
-		default:
 		}
 	}
 }
@@ -70,9 +82,21 @@ type WebSocket struct {
 	maxAliveTime string
 	pingInterval int
 	onMessage    MessageHandler
-	ctx          context.Context
-	cancel       context.CancelFunc
-	isConnected  bool
+
+	parentCtx context.Context
+	ctx       context.Context
+	cancel    context.CancelFunc
+	err       chan error
+
+	isConnected bool
+}
+
+func (ws *WebSocket) Error() chan error {
+	return ws.err
+}
+
+func (ws *WebSocket) newError(err error) {
+	ws.err <- err
 }
 
 type WebsocketOption func(*WebSocket)
@@ -89,14 +113,16 @@ func WithMaxAliveTime(maxAliveTime string) WebsocketOption {
 	}
 }
 
-func NewBybitPrivateWebSocket(url, apiKey, apiSecret string, handler MessageHandler, options ...WebsocketOption) *WebSocket {
+func NewBybitPrivateWebSocket(parentCtx context.Context, url, apiKey, apiSecret string, handler MessageHandler, options ...WebsocketOption) *WebSocket {
 	c := &WebSocket{
+		parentCtx:    parentCtx,
 		url:          url,
 		apiKey:       apiKey,
 		apiSecret:    apiSecret,
 		maxAliveTime: "",
 		pingInterval: 20,
 		onMessage:    handler,
+		err:          make(chan error),
 	}
 
 	// Apply the provided options
@@ -107,11 +133,13 @@ func NewBybitPrivateWebSocket(url, apiKey, apiSecret string, handler MessageHand
 	return c
 }
 
-func NewBybitPublicWebSocket(url string, handler MessageHandler) *WebSocket {
+func NewBybitPublicWebSocket(parentCtx context.Context, url string, handler MessageHandler) *WebSocket {
 	c := &WebSocket{
+		parentCtx:    parentCtx,
 		url:          url,
 		pingInterval: 20, // default is 20 seconds
 		onMessage:    handler,
+		err:          make(chan error),
 	}
 
 	return c
@@ -127,7 +155,7 @@ func (b *WebSocket) Connect() *WebSocket {
 
 	if b.requiresAuthentication() {
 		if err = b.sendAuth(); err != nil {
-			fmt.Println("Failed Connection:", fmt.Sprintf("%v", err))
+			b.newError(errors.New("Failed Connection: " + fmt.Sprintf("%v", err)))
 			return nil
 		}
 	}
@@ -136,8 +164,8 @@ func (b *WebSocket) Connect() *WebSocket {
 	go b.handleIncomingMessages()
 	go b.monitorConnection()
 
-	b.ctx, b.cancel = context.WithCancel(context.Background())
-	ping(b)
+	b.ctx, b.cancel = context.WithCancel(b.parentCtx)
+	go ping(b)
 
 	return b
 }
@@ -151,10 +179,9 @@ func (b *WebSocket) SendSubscription(args []string) (*WebSocket, error) {
 	}
 	fmt.Println("subscribe msg:", fmt.Sprintf("%v", subMessage["args"]))
 	if err := b.sendAsJson(subMessage); err != nil {
-		fmt.Println("Failed to send subscription:", err)
+		b.newError(errors.New("Failed to send subscription: " + err.Error()))
 		return b, err
 	}
-	fmt.Println("Subscription sent successfully.")
 	return b, nil
 }
 
@@ -192,14 +219,13 @@ func ping(b *WebSocket) {
 			}
 			jsonPingMessage, err := json.Marshal(pingMessage)
 			if err != nil {
-				fmt.Println("Failed to marshal ping message:", err)
+				b.newError(errors.New("Failed to marshal ping message: " + err.Error()))
 				continue
 			}
 			if err := b.conn.WriteMessage(websocket.TextMessage, jsonPingMessage); err != nil {
-				fmt.Println("Failed to send ping:", err)
+				b.newError(errors.New("Failed to send ping: " + err.Error()))
 				return
 			}
-			fmt.Println("Ping sent with UTC time:", currentTime)
 
 		case <-b.ctx.Done():
 			fmt.Println("Ping context closed, stopping ping.")
@@ -249,6 +275,7 @@ func (b *WebSocket) sendAuth() error {
 func (b *WebSocket) sendAsJson(v interface{}) error {
 	data, err := json.Marshal(v)
 	if err != nil {
+		b.newError(err)
 		return err
 	}
 	return b.send(string(data))
